@@ -8,10 +8,11 @@ mod keys;
 pub use keys::{AsciiKey, EncodedKey, KeyInput, Modifiers, SpecialKey};
 mod model;
 pub use model::{
-    BufferItem, Cell, Chunk, Cmdline, CompletionItem, Content, Cursor, Damage, DefaultColors,
-    Event, Frame, Grid, GridDamage, GridId, GridPlacement, GridPlacementKind, Highlight,
-    HighlightAttributes, HighlightId, HistoryEntry, Limits, Message, Messages, Mode, ModeInfo,
-    PopupAnchor, Popupmenu, Row, State, Tab, Tabline, Value, Wildmenu, WindowViewport,
+    BufferItem, Cell, Checkpoint, CheckpointError, Chunk, Cmdline, CompletionItem, Content, Cursor,
+    Damage, DefaultColors, Event, Frame, Grid, GridDamage, GridId, GridPlacement,
+    GridPlacementKind, Highlight, HighlightAttributes, HighlightId, HistoryEntry, Limits, Message,
+    Messages, Mode, ModeInfo, PopupAnchor, Popupmenu, Row, State, Tab, Tabline, Value, Wildmenu,
+    WindowViewport,
 };
 mod redraw;
 pub use redraw::Model;
@@ -23,7 +24,9 @@ pub use delivery::{Coalescing, Error as FrameError, Frames, UiHandler};
 mod input;
 pub use input::{Client, ClientError};
 mod connection;
-pub use connection::{Connection, ConnectionOptions, connect};
+pub use connection::{
+    ConnectCheckpointError, Connection, ConnectionOptions, connect, connect_with_checkpoint,
+};
 mod embedded;
 pub use embedded::Embedded;
 pub use nvim_rpc_plugin::NoHandler;

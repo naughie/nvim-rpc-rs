@@ -1,15 +1,16 @@
-use nvim_rpc::mp::encode::{TokioWrite, WriterSyncExt as _};
+use nvim_rpc::mp::encode::{Primitive, TokioWrite, WriterSyncExt as _};
 use nvim_rpc::read::TokioRead;
 use nvim_rpc::{Neovim, Receiver, api, rpc::Message};
 
+use nvim_rpc_ui::{ConnectCheckpointError, Event, GridId, NoHandler, connect_with_checkpoint};
 use nvim_rpc_ui::{ConnectionOptions, connect as connect_with_handler};
-use nvim_rpc_ui::{Event, GridId};
 
 use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, duplex, split};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
 use std::pin::Pin;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -26,6 +27,104 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     connect_with_handler(reader, writer, nvim_rpc_ui::NoHandler, options)
+}
+
+#[tokio::test]
+async fn reconnect_restores_the_last_flushed_checkpoint() {
+    async fn send(peer: &mut (impl AsyncWrite + Unpin), method: &str, params: impl Primitive) {
+        let mut buf = Vec::new();
+        buf.write_primitive((2u8, method, params)).consume();
+        peer.write_all(&buf).await.unwrap();
+        peer.flush().await.unwrap();
+    }
+
+    timeout(Duration::from_secs(2), async {
+        let (local, mut peer) = duplex(65536);
+        let (reader, writer) = split(local);
+        let options = ConnectionOptions::default();
+        let mut connection = connect(reader, writer, options).unwrap();
+
+        send(&mut peer, "nvim_error_event", (0, "before flush")).await;
+        connection.frames.recv().await.unwrap().unwrap();
+        assert!(connection.frames.checkpoint().is_none());
+
+        send(
+            &mut peer,
+            "redraw",
+            (
+                ("grid_resize", (4, 2, 1)),
+                ("grid_line", (4, 0, 0, (("A", 0), ("B",)), false)),
+                ("bell", ()),
+                ("flush", ()),
+                ("grid_clear", (4,)),
+            ),
+        )
+        .await;
+        let frame = connection.frames.recv().await.unwrap().unwrap();
+        assert!(matches!(frame.events.as_slice(), [Event::Bell]));
+
+        send(&mut peer, "nvim_error_event", (0, "after grid clear")).await;
+        let api_error = connection.frames.recv().await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&frame.state, &api_error.state));
+        connection.close_and_wait().await.unwrap();
+        drop(peer);
+
+        let checkpoint = connection.frames.checkpoint().unwrap();
+        assert!(ptr::eq(checkpoint.state(), frame.state.as_ref()));
+        drop(connection);
+
+        let (local, _peer) = duplex(65536);
+        let (reader, writer) = split(local);
+        let mut limited = options;
+        limited.limits.max_cells = 1;
+        assert!(matches!(
+            connect_with_checkpoint(reader, writer, NoHandler, limited, checkpoint.clone()),
+            Err(ConnectCheckpointError::Checkpoint(_))
+        ));
+
+        let (local, mut peer) = duplex(65536);
+        let (reader, writer) = split(local);
+        let mut connection =
+            connect_with_checkpoint(reader, writer, NoHandler, options, checkpoint).unwrap();
+        assert!(connection.frames.checkpoint().is_some());
+
+        send(&mut peer, "nvim_error_event", (0, "after restore")).await;
+        let first = connection.frames.recv().await.unwrap().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(first.damage.full);
+        assert!(matches!(first.events.as_slice(), [Event::RpcError { .. }]));
+        assert_eq!(
+            &*first.state.grids[&GridId(4)].cell(0, 0).unwrap().text,
+            "A"
+        );
+
+        send(
+            &mut peer,
+            "redraw",
+            (
+                ("grid_cursor_goto", (4, 0, 1)),
+                ("grid_line", (4, 0, 1, (("C", 0),), false)),
+                ("flush", ()),
+            ),
+        )
+        .await;
+        let frame = connection.frames.recv().await.unwrap().unwrap();
+        assert!(!frame.damage.full);
+        assert!(frame.damage.cursor);
+        assert!(frame.events.is_empty());
+        assert_eq!(frame.state.cursor.unwrap().grid, GridId(4));
+        let checkpoint = connection.frames.checkpoint().unwrap();
+        assert_eq!(
+            &*checkpoint.state().grids[&GridId(4)]
+                .cell(0, 1)
+                .unwrap()
+                .text,
+            "C"
+        );
+        connection.close_and_wait().await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -196,10 +196,11 @@ fn scroll(
     cols: i64,
 ) {
     // grid_call checks top <= bottom <= height and left <= right <= width.
-    // Model constructs exactly height rows of exactly width cells; only its
-    // private grid methods mutate these vectors. Thus all region bounds below
-    // are within their vectors. Traversing toward the source preserves overlap
-    // without allocating a scratch buffer or deep-copying unchanged rows.
+    // The model constructs grids with exactly height rows of exactly width
+    // cells and validates that shape before installing restored grids. Only
+    // its private grid methods mutate these vectors. Thus all region bounds
+    // below are within their vectors. Traversing toward the source preserves
+    // overlap without allocating a scratch buffer or deep-copying unchanged rows.
     let vertical = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
     let horizontal = usize::try_from(cols.unsigned_abs()).unwrap_or(usize::MAX);
     if vertical >= bottom - top || horizontal >= right - left {
