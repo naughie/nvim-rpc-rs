@@ -156,6 +156,27 @@ its terminal [`FrameError`], then ends. Use the plugin connection's
 [`wait()`](nvim_rpc_plugin::Connection::wait()) method to observe transport
 errors and request-handler failures.
 
+## Restore a display checkpoint
+
+Use a [`Checkpoint`] when replacing a UI connection to the same running
+Neovim process. Neovim can retain hidden grids across attachments and send
+updates for them without repeating their dimensions. A checkpoint preserves
+the grids and the rest of the display state from the last `flush`.
+
+Capture the latest checkpoint with [`Frames::checkpoint()`]. Use
+[`Checkpoint::encode()`] to save it in application-managed storage and
+[`Checkpoint::decode()`] to load it with an encoded byte budget and the
+destination model's [`Limits`]. The application matches the saved checkpoint
+to the running Neovim process and its UI configuration. A checkpoint remains
+usable in memory after its original connection closes.
+
+Pass the checkpoint to [`connect_with_checkpoint()`] before calling
+[`Client::attach()`]. For a plugin dispatcher, use [`UiHandler::from_checkpoint()`].
+For an application-managed dispatcher, use [`Model::from_checkpoint()`] or
+[`Ui::from_checkpoint()`]. The first published frame requests a full repaint.
+Read the restored state to initialize the display. Ordered events in the saved
+session, such as bells and connection requests, are excluded.
+
 ## Draw grids and widgets
 
 Attach with `UiOptions::ext_linegrid` enabled. Enable widget extensions such as

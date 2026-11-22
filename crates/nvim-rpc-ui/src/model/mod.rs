@@ -1,3 +1,5 @@
+mod checkpoint;
+pub use checkpoint::{Checkpoint, CheckpointError};
 mod grid;
 pub use grid::{Cell, Cursor, Grid, GridId, GridPlacement, GridPlacementKind, Row, WindowViewport};
 mod style;
@@ -14,6 +16,8 @@ mod frame;
 
 use nvim_rpc::Window;
 
+use serde::{Deserialize, Serialize};
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -22,18 +26,18 @@ use std::sync::Arc;
 /// String values retain their original bytes, independently of UTF-8 validity.
 /// Arrays and maps retain their element order; maps also retain duplicate keys.
 /// Cloning a string, binary value, array, map, or extension shares its storage.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
     Uint(u64),
     Float(f64),
-    String(Arc<[u8]>),
-    Binary(Arc<[u8]>),
+    String(#[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
+    Binary(#[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
     Array(Arc<[Value]>),
     Map(Arc<[(Value, Value)]>),
-    Extension(i8, Arc<[u8]>),
+    Extension(i8, #[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
 }
 
 /// Resource limits used by [`Model`](crate::Model).
@@ -81,7 +85,7 @@ impl Default for Limits {
 pub type ModeInfo = BTreeMap<Arc<str>, Value>;
 
 /// The current editor mode and its cursor-style selection.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Mode {
     pub name: Arc<str>,
     /// Index of the current cursor style in [`State::modes`].
@@ -95,7 +99,7 @@ pub struct Mode {
 /// Grid coordinates count screen cells. Command-line positions count UTF-8
 /// bytes. Grid contents and placements have separate lifetimes: hiding or
 /// closing a window does not destroy its grid.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub grids: Arc<BTreeMap<GridId, Arc<Grid>>>,
     pub highlights: Arc<BTreeMap<HighlightId, Highlight>>,

@@ -1,8 +1,13 @@
-use crate::{Backend, Client, Error, Frames, Limits, PresentationError, UiHandler};
+use crate::{
+    Backend, Checkpoint, CheckpointError, Client, Error, Frames, Limits, PresentationError,
+    UiHandler,
+};
 
-use nvim_rpc_plugin::Handler;
+use nvim_rpc_plugin::{ConnectionError, Handler};
 
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use std::fmt;
 
 /// Configures UI state and the shared RPC connection.
 #[derive(Debug, Clone, Copy, Default)]
@@ -12,6 +17,26 @@ pub struct ConnectionOptions {
     /// Bounds RPC messages, requests, replies, and queued callbacks.
     pub rpc: nvim_rpc_plugin::ConnectionOptions,
 }
+
+/// An error starting a shared RPC connection with a restored checkpoint.
+#[derive(Debug)]
+pub enum ConnectCheckpointError {
+    /// The checkpoint exceeds the configured UI limits or contains invalid state.
+    Checkpoint(CheckpointError),
+    /// The shared RPC connection failed to start.
+    Connection(ConnectionError),
+}
+
+impl fmt::Display for ConnectCheckpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Checkpoint(e) => e.fmt(f),
+            Self::Connection(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ConnectCheckpointError {}
 
 /// A UI attachment using the plugin library's RPC connection.
 ///
@@ -118,7 +143,44 @@ where
     H: Handler<W>,
 {
     let (handler, frames) = UiHandler::new(handler, options.limits);
-    let rpc = nvim_rpc_plugin::connect(reader, writer, handler, options.rpc)?;
+    Ok(start(reader, writer, handler, frames, options.rpc)?)
+}
+
+/// Starts an RPC connection with a checkpoint from the same Neovim process.
+///
+/// Validates the checkpoint against `options.limits` before starting the
+/// receive task. Attach the UI with [`Client::attach()`] as with [`connect()`].
+/// The first published frame requests a full repaint.
+pub fn connect_with_checkpoint<R, W, H>(
+    reader: R,
+    writer: W,
+    handler: H,
+    options: ConnectionOptions,
+    checkpoint: Checkpoint,
+) -> Result<Connection<W>, ConnectCheckpointError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: Handler<W>,
+{
+    let (handler, frames) = UiHandler::from_checkpoint(handler, checkpoint, options.limits)
+        .map_err(ConnectCheckpointError::Checkpoint)?;
+    start(reader, writer, handler, frames, options.rpc).map_err(ConnectCheckpointError::Connection)
+}
+
+fn start<R, W, H>(
+    reader: R,
+    writer: W,
+    handler: UiHandler<H>,
+    frames: Frames,
+    options: nvim_rpc_plugin::ConnectionOptions,
+) -> Result<Connection<W>, ConnectionError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: Handler<W>,
+{
+    let rpc = nvim_rpc_plugin::connect(reader, writer, handler, options)?;
     let client = Client::new(rpc.client.clone());
     Ok(Connection {
         client,

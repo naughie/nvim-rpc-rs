@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::{ProtocolError, RedrawError};
+use crate::{Checkpoint, CheckpointError, ProtocolError, RedrawError};
 
 mod decode;
 use decode::*;
@@ -33,6 +33,7 @@ type Result<T> = std::result::Result<T, ProtocolError>;
 pub struct Model {
     state: Arc<State>,
     committed: Arc<State>,
+    has_committed: bool,
     limits: Limits,
     cell_text: text::Cache,
     damage: Damage,
@@ -50,10 +51,38 @@ impl Default for Model {
 impl Model {
     /// Creates an empty model with explicit resource limits.
     pub fn new(limits: Limits) -> Self {
-        let state = Arc::default();
+        Self::with_committed(limits, None)
+    }
+
+    /// Creates a model from a flushed checkpoint after checking `limits`.
+    ///
+    /// Use a checkpoint from the same running Neovim process. The first
+    /// published frame requests a full repaint, and frame sequences start at 1.
+    pub fn from_checkpoint(
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> std::result::Result<Self, CheckpointError> {
+        let state = checkpoint.into_state(limits)?;
+        Ok(Self::with_committed(limits, Some(state)))
+    }
+
+    /// Exports the last flushed or restored state.
+    ///
+    /// Returns `None` until an empty model processes its first `flush`.
+    /// Pending updates and ordered events are excluded. A redraw error leaves
+    /// the last flushed checkpoint available.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.has_committed
+            .then(|| Checkpoint::from_committed(Arc::clone(&self.committed)))
+    }
+
+    fn with_committed(limits: Limits, committed: Option<Arc<State>>) -> Self {
+        let has_committed = committed.is_some();
+        let state = committed.unwrap_or_default();
         Self {
             committed: Arc::clone(&state),
             state,
+            has_committed,
             limits,
             cell_text: text::Cache::default(),
             damage: Damage::default(),
@@ -81,7 +110,7 @@ impl Model {
         notification: Notification<&[u8]>,
         mut emit: impl FnMut(Frame),
     ) -> Result<()> {
-        match self.apply_redraw_with(notification, |frame| {
+        match self.apply_redraw_with(notification, |frame, _| {
             emit(frame);
             Ok::<(), Infallible>(())
         }) {
@@ -94,7 +123,7 @@ impl Model {
     pub(crate) fn apply_redraw_with<E>(
         &mut self,
         notification: Notification<&[u8]>,
-        emit: impl FnMut(Frame) -> std::result::Result<(), E>,
+        emit: impl FnMut(Frame, bool) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         if self.failed {
             return Err(ProtocolError::Failed.into());
@@ -124,7 +153,7 @@ impl Model {
         params: Array<&[u8]>,
         mut emit: impl FnMut(Frame),
     ) -> Result<bool> {
-        match self.apply_notification_with(method, params, |frame| {
+        match self.apply_notification_with(method, params, |frame, _| {
             emit(frame);
             Ok::<(), Infallible>(())
         }) {
@@ -138,7 +167,7 @@ impl Model {
         &mut self,
         method: &[u8],
         params: Args<'_>,
-        mut emit: impl FnMut(Frame) -> std::result::Result<(), E>,
+        mut emit: impl FnMut(Frame, bool) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, RedrawError<E>> {
         if !matches!(method, b"redraw" | b"nvim_error_event") {
             return Ok(false);
@@ -160,7 +189,7 @@ impl Model {
     fn apply<E>(
         &mut self,
         params: Args<'_>,
-        emit: &mut impl FnMut(Frame) -> std::result::Result<(), E>,
+        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         for group in nvim_rpc::ui::Redraw::from_params(params) {
             let mut group = group?;
@@ -172,18 +201,7 @@ impl Model {
             for args in &mut group {
                 let args = args?;
                 if name == "flush" {
-                    self.sequence = self
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(ProtocolError::Limit("frame sequence"))?;
-                    self.committed = Arc::clone(&self.state);
-                    emit(Frame {
-                        sequence: self.sequence,
-                        state: Arc::clone(&self.state),
-                        damage: std::mem::take(&mut self.damage),
-                        events: std::mem::take(&mut self.events),
-                    })
-                    .map_err(RedrawError::Backend)?;
+                    self.publish(true, emit)?;
                 } else {
                     self.call(name, args).map_err(|e| match e {
                         ProtocolError::Invalid { reason, .. } => bad(name, reason),
@@ -198,21 +216,41 @@ impl Model {
     fn api_error<E>(
         &mut self,
         mut params: Args<'_>,
-        emit: &mut impl FnMut(Frame) -> std::result::Result<(), E>,
+        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         let kind = integer(next(&mut params)?)?;
         let message = text(next(&mut params)?, self.limits)?;
         self.push_event(Event::RpcError { kind, message })?;
+        self.publish(false, emit)
+    }
+
+    fn publish<E>(
+        &mut self,
+        flushed: bool,
+        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), RedrawError<E>> {
+        let first_restored = self.sequence == 0 && self.has_committed;
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or(ProtocolError::Limit("frame sequence"))?;
-        emit(Frame {
-            sequence: self.sequence,
-            state: Arc::clone(&self.committed),
-            damage: Damage::default(),
-            events: std::mem::take(&mut self.events),
-        })
+        let mut damage = if flushed {
+            self.committed = Arc::clone(&self.state);
+            self.has_committed = true;
+            std::mem::take(&mut self.damage)
+        } else {
+            Damage::default()
+        };
+        damage.full |= first_restored;
+        emit(
+            Frame {
+                sequence: self.sequence,
+                state: Arc::clone(&self.committed),
+                damage,
+                events: std::mem::take(&mut self.events),
+            },
+            flushed,
+        )
         .map_err(RedrawError::Backend)
     }
 

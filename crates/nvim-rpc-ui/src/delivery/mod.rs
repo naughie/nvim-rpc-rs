@@ -6,7 +6,7 @@ mod frames;
 use frames::Sender;
 pub use frames::{Coalescing, Frames};
 
-use crate::{Limits, Model, RedrawError};
+use crate::{Checkpoint, CheckpointError, Limits, Model, RedrawError};
 
 use nvim_rpc_plugin::{Array, FromParams, Handler, Neovim};
 
@@ -35,11 +35,31 @@ impl<H> UiHandler<H> {
     /// frame. `limits` controls the model, coalesced event count, and incremental
     /// damage bounds. Select the coalescing policy on the returned [`Frames`].
     pub fn new(handler: H, limits: Limits) -> (Self, Frames) {
-        let (frames, receiver) = Frames::channel(limits.max_pending_events, limits.max_grids);
+        Self::with_model(handler, Model::new(limits), limits)
+    }
+
+    /// Wraps a handler with the model restored by [`Model::from_checkpoint()`].
+    ///
+    /// Uses the same frame delivery limits as [`Self::new()`].
+    pub fn from_checkpoint(
+        handler: H,
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> Result<(Self, Frames), CheckpointError> {
+        let model = Model::from_checkpoint(checkpoint, limits)?;
+        Ok(Self::with_model(handler, model, limits))
+    }
+
+    fn with_model(handler: H, model: Model, limits: Limits) -> (Self, Frames) {
+        let (frames, receiver) = Frames::channel(
+            limits.max_pending_events,
+            limits.max_grids,
+            model.checkpoint(),
+        );
         (
             Self {
                 handler,
-                model: Mutex::new(Model::new(limits)),
+                model: Mutex::new(model),
                 frames,
             },
             receiver,
@@ -73,7 +93,9 @@ where
         let args = params.with_borrowed_buffer();
         let result = self
             .model()
-            .apply_notification_with(method, args, |frame| self.frames.send(frame));
+            .apply_notification_with(method, args, |frame, flushed| {
+                self.frames.send(frame, flushed)
+            });
         let error = match result {
             Ok(true) => return,
             Ok(false) => match H::Notification::from_params(params) {

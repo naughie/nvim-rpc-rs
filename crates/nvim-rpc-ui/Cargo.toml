@@ -16,6 +16,8 @@ all-features = true
 [dependencies]
 nvim-rpc.workspace = true
 nvim-rpc-plugin.workspace = true
+rmp-serde = "1.3"
+serde = { version = "1", features = ["derive", "rc"] }
 tokio = { workspace = true, features = ["sync", "time", "process"] }
 
 [dev-dependencies]

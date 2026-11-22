@@ -1,4 +1,4 @@
-use crate::{Backend, Limits, Model, RedrawError};
+use crate::{Backend, Checkpoint, CheckpointError, Limits, Model, RedrawError};
 
 use nvim_rpc::rpc::Notification;
 
@@ -29,6 +29,23 @@ impl<B> Ui<B> {
             backend,
             model: Model::new(limits),
         }
+    }
+
+    /// Creates a UI with the model restored by [`Model::from_checkpoint()`].
+    pub fn from_checkpoint(
+        backend: B,
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> Result<Self, CheckpointError> {
+        Ok(Self {
+            backend,
+            model: Model::from_checkpoint(checkpoint, limits)?,
+        })
+    }
+
+    /// Exports the last flushed or restored state through [`Model::checkpoint()`].
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.model.checkpoint()
     }
 
     /// Borrows the application's backend.
@@ -67,7 +84,7 @@ impl<B: Backend> Ui<B> {
         self.model.apply_notification_with(
             notification.method.as_slice(),
             notification.params.with_borrowed_buffer(),
-            |frame| self.backend.present(frame),
+            |frame, _| self.backend.present(frame),
         )
     }
 
@@ -85,6 +102,6 @@ impl<B: Backend> Ui<B> {
         notification: Notification<&[u8]>,
     ) -> Result<(), RedrawError<B::Error>> {
         self.model
-            .apply_redraw_with(notification, |frame| self.backend.present(frame))
+            .apply_redraw_with(notification, |frame, _| self.backend.present(frame))
     }
 }
