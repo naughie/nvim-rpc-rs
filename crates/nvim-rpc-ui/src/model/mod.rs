@@ -26,18 +26,21 @@ use std::sync::Arc;
 /// String values retain their original bytes, independently of UTF-8 validity.
 /// Arrays and maps retain their element order; maps also retain duplicate keys.
 /// Cloning a string, binary value, array, map, or extension shares its storage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
     Uint(u64),
     Float(f64),
-    String(#[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
-    Binary(#[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
+    String(#[serde(serialize_with = "checkpoint::wire::bytes::serialize")] Arc<[u8]>),
+    Binary(#[serde(serialize_with = "checkpoint::wire::bytes::serialize")] Arc<[u8]>),
     Array(Arc<[Value]>),
     Map(Arc<[(Value, Value)]>),
-    Extension(i8, #[serde(with = "checkpoint::wire::bytes")] Arc<[u8]>),
+    Extension(
+        i8,
+        #[serde(serialize_with = "checkpoint::wire::bytes::serialize")] Arc<[u8]>,
+    ),
 }
 
 /// Resource limits used by [`Model`](crate::Model).

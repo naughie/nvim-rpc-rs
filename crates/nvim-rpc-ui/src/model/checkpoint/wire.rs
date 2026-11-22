@@ -1,33 +1,36 @@
 use super::{CheckpointError, State};
 
-use serde::Serialize;
-
-use std::io::{self, Write};
+use postcard::Error;
+use postcard::ser_flavors::Flavor;
 
 pub(super) fn verify_payload(state: &State, payload: &[u8]) -> Result<(), CheckpointError> {
     struct Compare<'a>(&'a [u8]);
 
-    impl Write for Compare<'_> {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 = self.0.strip_prefix(buf).ok_or(io::ErrorKind::InvalidData)?;
-            Ok(buf.len())
+    impl Flavor for Compare<'_> {
+        type Output = ();
+
+        fn try_push(&mut self, byte: u8) -> Result<(), Error> {
+            self.try_extend(&[byte])
         }
 
-        fn flush(&mut self) -> io::Result<()> {
+        fn try_extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
+            self.0 = self.0.strip_prefix(bytes).ok_or(Error::SerdeSerCustom)?;
             Ok(())
+        }
+
+        fn finalize(self) -> Result<(), Error> {
+            if self.0.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::SerdeSerCustom)
+            }
         }
     }
 
     // Require the encoder's representation, including unique keys in state maps.
     // Value::Map stores its entries as an ordered sequence and preserves duplicates.
-    let mut compare = Compare(payload);
-    state
-        .serialize(&mut rmp_serde::Serializer::new(&mut compare))
-        .map_err(|_| CheckpointError::Invalid("payload representation"))?;
-    if !compare.0.is_empty() {
-        return Err(CheckpointError::Invalid("payload representation"));
-    }
-    Ok(())
+    postcard::serialize_with_flavor(state, Compare(payload))
+        .map_err(|_| CheckpointError::Invalid("payload representation"))
 }
 
 pub(in crate::model) mod handle {

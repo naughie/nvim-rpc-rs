@@ -1,23 +1,17 @@
 mod validate;
+mod value;
 pub(in crate::model) mod wire;
 
 use super::{Limits, State};
-
-use nvim_rpc::mp::decode::seek_to_eoo;
-
-use serde::{Deserialize, Serialize};
 
 use std::fmt;
 use std::sync::Arc;
 
 const MAGIC: &[u8] = b"NRUI";
-// Version 1 uses positional MessagePack structs. Field order and enum tags in
-// the serialized model types are part of the format.
-const VERSION: u8 = 1;
+// Version 2 uses Postcard. The field order and enum tags of serializable
+// model types are part of the format.
+const VERSION: u8 = 2;
 const MAX_VALUE_DEPTH: usize = 96;
-// A retained map adds up to two serde container frames per value level.
-// The remaining depth covers the containing state and widget structures.
-const MAX_WIRE_DEPTH: usize = 2 * MAX_VALUE_DEPTH + 32;
 const MAX_WIRE_LENGTH: usize = u32::MAX as usize;
 const WIRE_LIMITS: Limits = Limits {
     max_grids: MAX_WIRE_LENGTH,
@@ -36,11 +30,13 @@ const WIRE_LIMITS: Limits = Limits {
 /// [`Model::checkpoint()`](crate::Model::checkpoint) or
 /// [`Frames::checkpoint()`](crate::Frames::checkpoint) to capture one.
 ///
-/// Persist the bytes from [`Self::encode()`] as an opaque record. The header is
-/// `NRUI` followed by a one-byte format version. Version 1 stores one MessagePack
-/// value. The decoder accepts version 1 and rejects other versions.
+/// Persist the bytes from [`Self::encode()`] as an opaque record. An `NRUI`
+/// header and one-byte format version precede the [Postcard] payload. The
+/// decoder accepts format version 2 and rejects other versions.
 /// The application chooses where to store the bytes and must match the
 /// checkpoint to the same running Neovim process before restoring it.
+///
+/// [Postcard]: https://postcard.jamesmunns.com/wire-format
 #[derive(Debug, Clone)]
 pub struct Checkpoint(Arc<State>);
 
@@ -69,9 +65,7 @@ impl Checkpoint {
 
         let mut bytes = MAGIC.to_vec();
         bytes.push(VERSION);
-        self.0
-            .serialize(&mut rmp_serde::Serializer::new(&mut bytes))
-            .map_err(CheckpointError::Encode)?;
+        let bytes = postcard::to_extend(self.state(), bytes).map_err(CheckpointError::Encode)?;
         if bytes.len() > MAX_WIRE_LENGTH {
             return Err(CheckpointError::Limit("encoded bytes"));
         }
@@ -81,10 +75,9 @@ impl Checkpoint {
     /// Decodes a checkpoint within a byte budget and the destination model's limits.
     ///
     /// `max_bytes` bounds the complete encoded record, including its header.
-    /// The decoder checks that the record contains one complete value before
-    /// allocating the display state. The decoded state must satisfy `limits`
-    /// and the format's own nesting bound. Save the output of [`Self::encode()`]
-    /// directly so the payload representation is preserved.
+    /// The decoder reads one complete payload and checks the format's nesting
+    /// bound while decoding. The resulting state must satisfy `limits`. Save
+    /// the output of [`Self::encode()`] directly to preserve its representation.
     pub fn decode(bytes: &[u8], limits: Limits, max_bytes: usize) -> Result<Self, CheckpointError> {
         if bytes.len() > max_bytes.min(MAX_WIRE_LENGTH) {
             return Err(CheckpointError::Limit("encoded bytes"));
@@ -97,26 +90,11 @@ impl Checkpoint {
             return Err(CheckpointError::IncompatibleVersion(version));
         }
 
-        // A container announces at most 2 * u32::MAX children and consumes at
-        // least five bytes to announce that many. The u32 byte cap above
-        // keeps even the sum of every container's announced children in u64,
-        // the size of the MessagePack boundary scanner's item counter.
-        let mut remainder = payload;
-        seek_to_eoo(&mut remainder).map_err(|_| CheckpointError::Invalid("incomplete payload"))?;
+        let (state, remainder) =
+            postcard::take_from_bytes(payload).map_err(CheckpointError::Decode)?;
         if !remainder.is_empty() {
             return Err(CheckpointError::Invalid("trailing bytes"));
         }
-
-        let mut decoder = rmp_serde::Deserializer::from_read_ref(payload);
-        decoder.set_max_depth(MAX_WIRE_DEPTH);
-        let state = State::deserialize(&mut decoder).map_err(|e| match e {
-            rmp_serde::decode::Error::DepthLimitExceeded => CheckpointError::Limit("value depth"),
-            e => CheckpointError::Decode(e),
-        })?;
-        let limits = Limits {
-            max_depth: limits.max_depth.min(MAX_VALUE_DEPTH),
-            ..limits
-        };
         validate::state(&state, limits)?;
         wire::verify_payload(&state, payload)?;
         Ok(Self(Arc::new(state)))
@@ -132,10 +110,10 @@ pub enum CheckpointError {
     Invalid(&'static str),
     /// A resource limit was exceeded.
     Limit(&'static str),
-    /// The MessagePack payload could not be written.
-    Encode(rmp_serde::encode::Error),
-    /// The MessagePack payload could not be parsed as a checkpoint.
-    Decode(rmp_serde::decode::Error),
+    /// The Postcard payload could not be written.
+    Encode(postcard::Error),
+    /// The Postcard payload could not be parsed as a checkpoint.
+    Decode(postcard::Error),
 }
 
 impl fmt::Display for CheckpointError {

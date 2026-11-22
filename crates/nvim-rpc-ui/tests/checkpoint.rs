@@ -502,16 +502,16 @@ fn rejects_invalid_truncated_incompatible_and_over_limit_checkpoints() {
 }
 
 #[test]
-fn reads_version_one_checkpoint() {
-    // Version 1 output for a 1×1 grid 4 containing "A", the cursor on that
+fn reads_postcard_checkpoint() {
+    // Version 2 output for a 1×1 grid 4 containing "A", the cursor on that
     // cell, and the title "fixture".
-    const V1: &[u8] = b"NRUI\x01\xdc\x00\x15\x81\x04\x93\x01\x01\x91\x92\x91\
-                       \x92\xa1A\x00\xc2\x80\x80\x95\xc0\xc0\xc0\x00\x00\x80\x80\x93\
-                       \x04\x00\x00\x80\x90\xc0\xc0\xc0\x96\x90\x90\x90\x90\xc0\xc2\x80\
-                       \x90\x93\xa0\x00\xc2\xa7fixture\xa0\xa0\xc2\xc2";
+    const V2: &[u8] = b"NRUI\x02\x01\x08\x01\x01\x01\x01\x01A\x00\x00\
+                       \x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x08\x00\x00\
+                       \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+                       \x00\x00\x00\x00\x00\x07fixture\x00\x00\x00\x00";
 
     let limits = Limits::default();
-    let checkpoint = Checkpoint::decode(V1, limits, V1.len()).unwrap();
+    let checkpoint = Checkpoint::decode(V2, limits, V2.len()).unwrap();
     let state = checkpoint.state();
     assert_eq!(state.title.as_ref(), "fixture");
     assert_eq!(
@@ -520,16 +520,38 @@ fn reads_version_one_checkpoint() {
     );
     let cursor = state.cursor.unwrap();
     assert_eq!((cursor.grid, cursor.row, cursor.col), (GridId(4), 0, 0));
-    assert_eq!(checkpoint.encode().unwrap(), V1);
+    assert_eq!(checkpoint.encode().unwrap(), V2);
 
-    let mut malformed = V1.to_vec();
+    let mut malformed = V2.to_vec();
     let grid = malformed
-        .windows(6)
-        .position(|bytes| bytes == b"\x81\x04\x93\x01\x01\x91")
+        .windows(8)
+        .position(|bytes| bytes == b"\x01\x08\x01\x01\x01\x01\x01A")
         .unwrap();
-    malformed[grid + 3] = 2;
+    malformed[grid + 2] = 2;
     assert!(matches!(
         Checkpoint::decode(&malformed, limits, malformed.len()),
         Err(CheckpointError::Invalid("grid column count"))
+    ));
+
+    let mut noncanonical = V2.to_vec();
+    noncanonical.splice(grid..grid + 1, [0x81, 0x00]);
+    assert!(matches!(
+        Checkpoint::decode(&noncanonical, limits, noncanonical.len()),
+        Err(CheckpointError::Invalid("payload representation"))
+    ));
+
+    // A complete row count with no rows must fail without reserving that count.
+    let oversized = b"NRUI\x02\x01\x08\x01\x01\xff\xff\xff\xff\x0f";
+    assert!(matches!(
+        Checkpoint::decode(oversized, limits, oversized.len()),
+        Err(CheckpointError::Decode(
+            postcard::Error::DeserializeUnexpectedEnd
+        ))
+    ));
+
+    let v1 = b"NRUI\x01\xdc\x00\x15";
+    assert!(matches!(
+        Checkpoint::decode(v1, limits, v1.len()),
+        Err(CheckpointError::IncompatibleVersion(1))
     ));
 }

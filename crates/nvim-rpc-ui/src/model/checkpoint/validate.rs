@@ -438,9 +438,28 @@ mod tests {
         };
         let restored = Checkpoint::decode(&bytes, limits, bytes.len()).unwrap();
         assert_eq!(restored.state().options, checkpoint.state().options);
+        let too_deep = make(MAX_VALUE_DEPTH + 1);
         assert!(matches!(
-            make(MAX_VALUE_DEPTH + 1).encode(),
+            too_deep.encode(),
             Err(CheckpointError::Limit("value depth"))
+        ));
+
+        use crate::model::checkpoint::{MAGIC, VERSION};
+
+        // Bypass the encoder's limit to exercise rejection during decoding.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(VERSION);
+        let bytes = postcard::to_extend(too_deep.state(), bytes).unwrap();
+        assert!(matches!(
+            Checkpoint::decode(
+                &bytes,
+                Limits {
+                    max_depth: usize::MAX,
+                    ..limits
+                },
+                bytes.len()
+            ),
+            Err(CheckpointError::Decode(_))
         ));
     }
 }
