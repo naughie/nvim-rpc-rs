@@ -26,7 +26,9 @@ const WIRE_LIMITS: Limits = Limits {
 /// A committed display state that can initialize another UI attachment.
 ///
 /// A checkpoint retains hidden grids and the rest of the display state. Frame
-/// sequences, damage, and one-shot events are outside the checkpoint. Use
+/// sequences, damage, and one-shot events are outside the checkpoint. A
+/// checkpoint exported by a reference model can also retain grids and
+/// placements that were absent from its most recent frame. Use
 /// [`Model::checkpoint()`](crate::Model::checkpoint) or
 /// [`Frames::checkpoint()`](crate::Frames::checkpoint) to capture one.
 ///
@@ -50,7 +52,10 @@ impl Checkpoint {
         Ok(self.0)
     }
 
-    /// Borrows the committed display state.
+    /// Borrows the checkpoint's retained display state.
+    ///
+    /// When captured in reference mode, this state can contain retained data
+    /// that does not appear in the latest frame.
     pub fn state(&self) -> &State {
         &self.0
     }

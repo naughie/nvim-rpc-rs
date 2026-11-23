@@ -43,6 +43,18 @@ impl<B> Ui<B> {
         })
     }
 
+    /// Creates a UI using [`Model::with_checkpoint_reference()`].
+    pub fn with_checkpoint_reference(
+        backend: B,
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> Result<Self, CheckpointError> {
+        Ok(Self {
+            backend,
+            model: Model::with_checkpoint_reference(checkpoint, limits)?,
+        })
+    }
+
     /// Exports the last flushed or restored state through [`Model::checkpoint()`].
     pub fn checkpoint(&self) -> Option<Checkpoint> {
         self.model.checkpoint()

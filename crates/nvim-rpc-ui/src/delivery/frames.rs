@@ -47,7 +47,7 @@ pub(super) struct Sender {
 }
 
 impl Sender {
-    pub(super) fn send(&self, frame: Frame, flushed: bool) -> Result<(), Error> {
+    pub(super) fn send(&self, frame: Frame, checkpoint: Option<&Checkpoint>) -> Result<(), Error> {
         let mut pending = self.shared.pending();
         if !pending.receiver_alive {
             return Err(Error::ReceiverClosed);
@@ -56,7 +56,7 @@ impl Sender {
             return Err(Error::Protocol(crate::ProtocolError::Failed));
         }
         let coalescing = pending.coalescing;
-        let frame = if let Some(previous) = &mut pending.frame {
+        if let Some(previous) = &mut pending.frame {
             match coalescing {
                 Coalescing::FullRepaint => previous.coalesce(frame, self.max_events),
                 Coalescing::Incremental => {
@@ -64,12 +64,11 @@ impl Sender {
                 }
             }
             .map_err(Error::Protocol)?;
-            previous
         } else {
-            pending.frame.insert(frame)
-        };
-        if flushed {
-            pending.checkpoint = Some(Checkpoint::from_committed(Arc::clone(&frame.state)));
+            pending.frame = Some(frame);
+        }
+        if let Some(checkpoint) = checkpoint {
+            pending.checkpoint = Some(checkpoint.clone());
         }
         drop(pending);
         self.shared.ready.notify_one();
@@ -139,8 +138,10 @@ impl Frames {
 
     /// Exports the latest successfully queued flush or the restored checkpoint.
     ///
-    /// Returns `None` before the first flush of a fresh UI. The checkpoint can
-    /// be newer than the last frame received by the application and remains
+    /// Returns `None` before the first flush of a fresh or reference UI.
+    /// In reference mode the checkpoint can also hold grids and placements
+    /// omitted from the frame. It can be newer than the last frame received
+    /// by the application and remains
     /// available after the stream ends.
     pub fn checkpoint(&self) -> Option<Checkpoint> {
         self.shared.pending().checkpoint.clone()
@@ -227,6 +228,11 @@ mod tests {
 
     use std::ptr;
 
+    fn send(sender: &Sender, frame: Frame) -> Result<(), Error> {
+        let checkpoint = Checkpoint::from_committed(Arc::clone(&frame.state));
+        sender.send(frame, Some(&checkpoint))
+    }
+
     fn frame(sequence: u64) -> Frame {
         Frame {
             sequence,
@@ -252,8 +258,8 @@ mod tests {
             let mut next = frame(2);
             next.damage.cursor = true;
             let state = Arc::clone(&next.state);
-            sender.send(first, true).unwrap();
-            sender.send(next, true).unwrap();
+            send(&sender, first).unwrap();
+            send(&sender, next).unwrap();
 
             let latest = frames.recv().await.unwrap().unwrap();
             assert_eq!(latest.sequence, 2);
@@ -278,24 +284,24 @@ mod tests {
     #[tokio::test]
     async fn policy_changes_affect_future_merges_without_recomputing_queued_damage() {
         let (sender, mut frames) = Frames::channel(3, 2, None);
-        sender.send(frame(1), true).unwrap();
-        sender.send(frame(2), true).unwrap();
+        send(&sender, frame(1)).unwrap();
+        send(&sender, frame(2)).unwrap();
         frames.set_coalescing(Coalescing::Incremental);
-        sender.send(frame(3), true).unwrap();
+        send(&sender, frame(3)).unwrap();
         let latest = frames.recv().await.unwrap().unwrap();
         assert_eq!(latest.sequence, 3);
         assert_eq!(latest.events.len(), 3);
         assert!(latest.damage.full);
 
-        sender.send(frame(4), true).unwrap();
-        sender.send(frame(5), true).unwrap();
+        send(&sender, frame(4)).unwrap();
+        send(&sender, frame(5)).unwrap();
         frames.set_coalescing(Coalescing::FullRepaint);
         let latest = frames.recv().await.unwrap().unwrap();
         assert_eq!(latest.sequence, 5);
         assert!(!latest.damage.full);
 
-        sender.send(frame(6), true).unwrap();
-        sender.send(frame(7), true).unwrap();
+        send(&sender, frame(6)).unwrap();
+        send(&sender, frame(7)).unwrap();
         assert!(frames.recv().await.unwrap().unwrap().damage.full);
     }
 
@@ -306,9 +312,9 @@ mod tests {
         let mut first = frame(1);
         first.damage.cursor = true;
         let state = Arc::clone(&first.state);
-        sender.send(first, true).unwrap();
+        send(&sender, first).unwrap();
         assert!(matches!(
-            sender.send(frame(2), true),
+            send(&sender, frame(2)),
             Err(Error::Protocol(crate::ProtocolError::Limit(
                 "pending events"
             )))
@@ -337,8 +343,8 @@ mod tests {
         let mut next = frame(2);
         next.damage.removed_grids.push(GridId(2));
         next.damage.layout = true;
-        sender.send(first, true).unwrap();
-        sender.send(next, true).unwrap();
+        send(&sender, first).unwrap();
+        send(&sender, next).unwrap();
         let latest = frames.recv().await.unwrap().unwrap();
         assert_eq!(latest.sequence, 2);
         assert!(latest.damage.full);
@@ -351,7 +357,7 @@ mod tests {
         let (sender, mut frames) = Frames::channel(2000, 512, None);
         let producer = std::thread::spawn(move || {
             for sequence in 1..=2000 {
-                sender.send(frame(sequence), true).unwrap();
+                send(&sender, frame(sequence)).unwrap();
             }
         });
         let mut events = Vec::new();
@@ -386,8 +392,8 @@ mod tests {
             result = frames.recv() => panic!("unexpected frame: {result:?}"),
             () = tokio::task::yield_now() => {}
         }
-        sender.send(frame(1), true).unwrap();
-        sender.send(frame(2), true).unwrap();
+        send(&sender, frame(1)).unwrap();
+        send(&sender, frame(2)).unwrap();
         drop(sender);
         let frame = frames.recv().await.unwrap().unwrap();
         assert_eq!(frame.sequence, 2);
