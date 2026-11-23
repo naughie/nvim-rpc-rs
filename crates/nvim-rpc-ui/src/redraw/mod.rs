@@ -4,6 +4,8 @@ use crate::{Checkpoint, CheckpointError, ProtocolError, RedrawError};
 mod decode;
 use decode::*;
 mod grid;
+mod reference;
+use reference::Reference;
 mod text;
 mod widgets;
 mod windows;
@@ -12,6 +14,7 @@ use nvim_rpc::api_types::{Decode, DecodeError};
 use nvim_rpc::mp::decode::{Array, Object};
 use nvim_rpc::rpc::Notification;
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -33,7 +36,8 @@ type Result<T> = std::result::Result<T, ProtocolError>;
 pub struct Model {
     state: Arc<State>,
     committed: Arc<State>,
-    has_committed: bool,
+    checkpoint: Option<Checkpoint>,
+    reference: Option<Reference>,
     limits: Limits,
     cell_text: text::Cache,
     damage: Damage,
@@ -66,23 +70,53 @@ impl Model {
         Ok(Self::with_committed(limits, Some(state)))
     }
 
+    /// Creates a fresh model with a checkpoint as a redraw reference.
+    ///
+    /// Supply a checkpoint from the same running Neovim process and UI
+    /// configuration. The model uses saved grid contents and highlight
+    /// definitions when new events refer to them. A viewport for the same grid
+    /// and window can also recover its saved placement and hidden state.
+    /// Windows absent from the new stream remain outside frames. Command lines
+    /// and external widgets are created by the new stream.
+    ///
+    /// The first redraw flush requests a full repaint.
+    pub fn with_checkpoint_reference(
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> std::result::Result<Self, CheckpointError> {
+        let state = checkpoint.into_state(limits)?;
+        let mut model = Self::new(limits);
+        model.reference = Some(Reference::new(&state));
+        model.damage.full = true;
+        Ok(model)
+    }
+
     /// Exports the last flushed or restored state.
     ///
-    /// Returns `None` until an empty model processes its first `flush`.
+    /// Returns `None` before the first `flush` of a fresh or reference model.
+    /// In reference mode the checkpoint can include saved grids and placements
+    /// that were absent from the frame. They remain available for future
+    /// attachments within the model's limits.
     /// Pending updates and ordered events are excluded. A redraw error leaves
     /// the last flushed checkpoint available.
     pub fn checkpoint(&self) -> Option<Checkpoint> {
-        self.has_committed
-            .then(|| Checkpoint::from_committed(Arc::clone(&self.committed)))
+        self.checkpoint.clone()
+    }
+
+    pub(crate) fn grids(&self) -> &Arc<BTreeMap<GridId, Arc<Grid>>> {
+        &self.state.grids
     }
 
     fn with_committed(limits: Limits, committed: Option<Arc<State>>) -> Self {
-        let has_committed = committed.is_some();
+        let checkpoint = committed
+            .as_ref()
+            .map(|state| Checkpoint::from_committed(Arc::clone(state)));
         let state = committed.unwrap_or_default();
         Self {
             committed: Arc::clone(&state),
             state,
-            has_committed,
+            checkpoint,
+            reference: None,
             limits,
             cell_text: text::Cache::default(),
             damage: Damage::default(),
@@ -123,7 +157,7 @@ impl Model {
     pub(crate) fn apply_redraw_with<E>(
         &mut self,
         notification: Notification<&[u8]>,
-        emit: impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+        emit: impl FnMut(Frame, Option<&Checkpoint>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         if self.failed {
             return Err(ProtocolError::Failed.into());
@@ -167,7 +201,7 @@ impl Model {
         &mut self,
         method: &[u8],
         params: Args<'_>,
-        mut emit: impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+        mut emit: impl FnMut(Frame, Option<&Checkpoint>) -> std::result::Result<(), E>,
     ) -> std::result::Result<bool, RedrawError<E>> {
         if !matches!(method, b"redraw" | b"nvim_error_event") {
             return Ok(false);
@@ -189,7 +223,7 @@ impl Model {
     fn apply<E>(
         &mut self,
         params: Args<'_>,
-        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+        emit: &mut impl FnMut(Frame, Option<&Checkpoint>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         for group in nvim_rpc::ui::Redraw::from_params(params) {
             let mut group = group?;
@@ -216,7 +250,7 @@ impl Model {
     fn api_error<E>(
         &mut self,
         mut params: Args<'_>,
-        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+        emit: &mut impl FnMut(Frame, Option<&Checkpoint>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
         let kind = integer(next(&mut params)?)?;
         let message = text(next(&mut params)?, self.limits)?;
@@ -227,16 +261,24 @@ impl Model {
     fn publish<E>(
         &mut self,
         flushed: bool,
-        emit: &mut impl FnMut(Frame, bool) -> std::result::Result<(), E>,
+        emit: &mut impl FnMut(Frame, Option<&Checkpoint>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), RedrawError<E>> {
-        let first_restored = self.sequence == 0 && self.has_committed;
+        let first_restored = self.sequence == 0 && self.checkpoint.is_some();
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or(ProtocolError::Limit("frame sequence"))?;
         let mut damage = if flushed {
-            self.committed = Arc::clone(&self.state);
-            self.has_committed = true;
+            // Reference changes also mutate live state. Reuse the combined
+            // checkpoint when a flush carries only ordered events.
+            if self.checkpoint.is_none() || !Arc::ptr_eq(&self.committed, &self.state) {
+                self.committed = Arc::clone(&self.state);
+                let state = self.reference.as_ref().map_or_else(
+                    || Arc::clone(&self.committed),
+                    |reference| reference.capture(&self.committed, self.limits),
+                );
+                self.checkpoint = Some(Checkpoint::from_committed(state));
+            }
             std::mem::take(&mut self.damage)
         } else {
             Damage::default()
@@ -249,7 +291,7 @@ impl Model {
                 damage,
                 events: std::mem::take(&mut self.events),
             },
-            flushed,
+            self.checkpoint.as_ref().filter(|_| flushed),
         )
         .map_err(RedrawError::Backend)
     }
@@ -274,6 +316,9 @@ impl Model {
                 let rgb = attributes(next(&mut a)?, limits)?;
                 let cterm = attributes(next(&mut a)?, limits)?;
                 let info = values(next(&mut a)?, limits)?;
+                if let Some(reference) = &mut self.reference {
+                    reference.forget_highlight(id);
+                }
                 if !self.state.highlights.contains_key(&id)
                     && self.state.highlights.len() >= limits.max_collection_len
                 {
@@ -286,6 +331,13 @@ impl Model {
             "hl_group_set" => {
                 let name = text(next(&mut a)?, limits)?;
                 let id = hl_id(next(&mut a)?)?;
+                if let Some(reference) = &self.reference {
+                    self.damage.full |= reference.restore_highlight(
+                        id,
+                        &mut Arc::make_mut(&mut self.state).highlights,
+                        limits,
+                    )?;
+                }
                 let groups = Arc::make_mut(&mut Arc::make_mut(&mut self.state).highlight_groups);
                 bounded_insert(groups, name, id, limits)?;
                 self.damage.widgets = true;

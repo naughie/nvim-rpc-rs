@@ -168,6 +168,28 @@ where
     start(reader, writer, handler, frames, options.rpc).map_err(ConnectCheckpointError::Connection)
 }
 
+/// Starts an RPC connection using [`Model::with_checkpoint_reference()`](crate::Model::with_checkpoint_reference).
+///
+/// Validates the checkpoint before starting the receive task. Attach the UI
+/// with [`Client::attach()`] as with [`connect()`].
+pub fn connect_with_checkpoint_reference<R, W, H>(
+    reader: R,
+    writer: W,
+    handler: H,
+    options: ConnectionOptions,
+    checkpoint: Checkpoint,
+) -> Result<Connection<W>, ConnectCheckpointError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: Handler<W>,
+{
+    let (handler, frames) =
+        UiHandler::with_checkpoint_reference(handler, checkpoint, options.limits)
+            .map_err(ConnectCheckpointError::Checkpoint)?;
+    start(reader, writer, handler, frames, options.rpc).map_err(ConnectCheckpointError::Connection)
+}
+
 fn start<R, W, H>(
     reader: R,
     writer: W,

@@ -555,3 +555,235 @@ fn reads_postcard_checkpoint() {
         Err(CheckpointError::IncompatibleVersion(1))
     ));
 }
+
+#[test]
+fn uses_saved_cells_after_a_fresh_reference_and_never_replays_transient_widgets() {
+    let limits = Limits::default();
+    let mut model = Model::new(limits);
+    redraw(
+        &mut model,
+        (
+            ("grid_resize", (2, 3, 1), (5, 1, 1)),
+            ("grid_line", (2, 0, 0, (("a", 1), ("b",), ("c",)), false)),
+            ("grid_line", (5, 0, 0, (("complete", 1),), false)),
+            (
+                "hl_attr_define",
+                (
+                    1,
+                    Map([("foreground", 0x123456)]),
+                    Map([("foreground", 3)]),
+                    (),
+                ),
+            ),
+            ("win_float_pos", (2, 1000, "NW", 1, 2.0, 3.0, true, 50)),
+            ("win_float_pos", (5, 1001, "NW", 1, 4.0, 5.0, true, 50)),
+            ("cmdline_show", (((0, "detach"),), 6, ":", "", 0, 1)),
+            ("popupmenu_show", ((("detach", "", "", ""),), 0, 0, 0, -1)),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+
+    let mut attached =
+        Model::with_checkpoint_reference(model.checkpoint().unwrap(), limits).unwrap();
+    assert!(attached.checkpoint().is_none());
+    let frame = flush(&mut attached);
+    assert!(frame.damage.full);
+    assert!(frame.state.grids.is_empty());
+    assert!(frame.state.placements.is_empty());
+    assert!(frame.state.cmdlines.is_empty());
+    assert!(frame.state.popupmenu.is_none());
+
+    // An unreferenced grid can still surface in a subsequent attachment.
+    let bytes = attached.checkpoint().unwrap().encode().unwrap();
+    let checkpoint = Checkpoint::decode(&bytes, limits, bytes.len()).unwrap();
+    let mut attached = Model::with_checkpoint_reference(checkpoint, limits).unwrap();
+
+    let frames = redraw(
+        &mut attached,
+        (
+            ("grid_line", (2, 0, 1, (("B", 1),), false)),
+            ("flush", ()),
+            ("win_float_pos", (2, 1000, "NW", 1, 6.0, 7.0, true, 50)),
+            ("grid_cursor_goto", (2, 0, 2)),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+    let [hidden, shown]: [Frame; 2] = frames.try_into().unwrap();
+
+    assert!(!hidden.state.placements.contains_key(&GridId(2)));
+    let grid = &shown.state.grids[&GridId(2)];
+    let text: Vec<_> = grid.rows[0]
+        .cells
+        .iter()
+        .map(|cell| cell.text.as_ref())
+        .collect();
+    assert_eq!(text, ["a", "B", "c"]);
+    assert_eq!(
+        shown.state.highlights[&HighlightId(1)].rgb.foreground,
+        Some(0x123456)
+    );
+    assert!(matches!(
+        shown.state.placements[&GridId(2)].kind,
+        GridPlacementKind::Floating {
+            anchor_row: 6.0,
+            anchor_col: 7.0,
+            ..
+        }
+    ));
+    assert_eq!(shown.state.cursor.unwrap().grid, GridId(2));
+    assert!(!shown.state.grids.contains_key(&GridId(5)));
+    assert!(!shown.state.placements.contains_key(&GridId(5)));
+}
+
+#[test]
+fn restores_matching_viewports_and_preserves_new_hides_closes_and_highlights() {
+    let limits = Limits::default();
+    let mut model = Model::new(limits);
+    redraw(
+        &mut model,
+        (
+            (
+                "grid_resize",
+                (2, 3, 1),
+                (3, 1, 1),
+                (4, 1, 1),
+                (5, 1, 1),
+                (6, 1, 1),
+            ),
+            ("grid_line", (2, 0, 0, (("a", 1), ("b",), ("c",)), false)),
+            (
+                "hl_attr_define",
+                (
+                    1,
+                    Map([("foreground", 0x123456)]),
+                    Map([("foreground", 3)]),
+                    (),
+                ),
+            ),
+            (
+                "win_pos",
+                (2, 1000, 1, 3, 3, 1),
+                (3, 1001, 4, 5, 1, 1),
+                (4, 1002, 6, 7, 1, 1),
+                (5, 1003, 8, 9, 1, 1),
+                (6, 1004, 10, 11, 1, 1),
+            ),
+            (
+                "win_viewport_margins",
+                (2, 1000, 1, 2, 3, 4),
+                (3, 1001, 4, 3, 2, 1),
+            ),
+            ("win_hide", (3,)),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+
+    let mut attached =
+        Model::with_checkpoint_reference(model.checkpoint().unwrap(), limits).unwrap();
+    let frames = redraw(
+        &mut attached,
+        (
+            ("grid_resize", (2, 2, 1)),
+            (
+                "hl_attr_define",
+                (
+                    1,
+                    Map([("foreground", 0xaabbcc)]),
+                    Map([("foreground", 4)]),
+                    (),
+                ),
+            ),
+            ("win_viewport_margins", (3, 1001, 1, 2, 3, 4)),
+            ("win_hide", (4,)),
+            ("win_close", (5,)),
+            (
+                "win_viewport",
+                (2, 1000, 0, 1, 0, 0, 1, 0),
+                (3, 1001, 0, 1, 0, 0, 1, 0),
+                (4, 1002, 0, 1, 0, 0, 1, 0),
+                (5, 1003, 0, 1, 0, 0, 1, 0),
+                (6, 1234, 0, 1, 0, 0, 1, 0),
+            ),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+    let state = &frames[0].state;
+
+    let grid = &state.grids[&GridId(2)];
+    assert_eq!((grid.width, grid.height), (2, 1));
+    assert_eq!(grid.cell(0, 1).unwrap().text.as_ref(), "b");
+    assert_eq!(
+        state.highlights[&HighlightId(1)].rgb.foreground,
+        Some(0xaabbcc)
+    );
+
+    assert!(matches!(
+        state.placements[&GridId(2)].kind,
+        GridPlacementKind::Normal { row: 1, col: 3, .. }
+    ));
+    assert!(!state.placements[&GridId(2)].hidden);
+    assert!(state.placements[&GridId(3)].hidden);
+    assert_eq!(state.viewports[&GridId(2)].margins, [1, 2, 3, 4]);
+    assert_eq!(state.viewports[&GridId(3)].margins, [1, 2, 3, 4]);
+    assert!(state.placements[&GridId(4)].hidden);
+    for id in [GridId(5), GridId(6)] {
+        assert!(!state.placements.contains_key(&id));
+        assert!(!state.grids.contains_key(&id));
+    }
+    let saved = attached.checkpoint().unwrap();
+    assert!(!saved.state().placements.contains_key(&GridId(5)));
+    assert!(!saved.state().placements.contains_key(&GridId(6)));
+}
+
+#[test]
+fn caps_combined_checkpoints_and_invalidates_destroyed_reference_grids() {
+    let limits = Limits {
+        max_grids: 2,
+        max_cells: 3,
+        ..Limits::default()
+    };
+    let mut model = Model::new(limits);
+    redraw(
+        &mut model,
+        (
+            ("grid_resize", (2, 1, 1), (3, 2, 1)),
+            ("win_pos", (2, 1000, 0, 0, 1, 1)),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+    let mut attached =
+        Model::with_checkpoint_reference(model.checkpoint().unwrap(), limits).unwrap();
+
+    redraw(&mut attached, (("grid_resize", (4, 2, 1)),)).unwrap();
+    let frame = flush(&mut attached);
+    let active: Vec<_> = frame.state.grids.keys().copied().collect();
+    assert_eq!(active, [GridId(4)]);
+    let bytes = attached.checkpoint().unwrap().encode().unwrap();
+    let saved = Checkpoint::decode(&bytes, limits, bytes.len()).unwrap();
+    let stored: Vec<_> = saved.state().grids.keys().copied().collect();
+    assert_eq!(stored, [GridId(2), GridId(4)]);
+
+    redraw(&mut attached, (("grid_destroy", (2,)),)).unwrap();
+    assert!(
+        attached
+            .checkpoint()
+            .unwrap()
+            .state()
+            .grids
+            .contains_key(&GridId(2))
+    );
+    flush(&mut attached);
+    let checkpoint = attached.checkpoint().unwrap();
+    assert!(!checkpoint.state().grids.contains_key(&GridId(2)));
+    assert!(!checkpoint.state().placements.contains_key(&GridId(2)));
+
+    assert!(matches!(
+        redraw(&mut attached, (("grid_cursor_goto", (2, 0, 0)),)),
+        Err(ProtocolError::Invalid { event, reason: "unknown grid" }) if event == "grid_cursor_goto"
+    ));
+}

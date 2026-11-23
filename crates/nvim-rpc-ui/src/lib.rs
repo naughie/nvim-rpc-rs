@@ -26,6 +26,7 @@ pub use input::{Client, ClientError};
 mod connection;
 pub use connection::{
     ConnectCheckpointError, Connection, ConnectionOptions, connect, connect_with_checkpoint,
+    connect_with_checkpoint_reference,
 };
 mod embedded;
 pub use embedded::Embedded;

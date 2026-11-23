@@ -1,4 +1,5 @@
 use super::decode::*;
+use super::reference::placement_window;
 use super::{Args, Model, Result};
 
 use crate::model::*;
@@ -62,6 +63,9 @@ impl Model {
             }
             "win_hide" => {
                 let id = grid_id(next(&mut a)?)?;
+                if let Some(reference) = &mut self.reference {
+                    reference.hide_placement(id);
+                }
                 if let Some(p) =
                     Arc::make_mut(&mut Arc::make_mut(&mut self.state).placements).get_mut(&id)
                 {
@@ -71,6 +75,10 @@ impl Model {
             }
             "win_close" => {
                 let id = grid_id(next(&mut a)?)?;
+                if let Some(reference) = &mut self.reference {
+                    reference.take_placement(id);
+                    reference.take_viewport(id);
+                }
                 Arc::make_mut(&mut Arc::make_mut(&mut self.state).placements).remove(&id);
                 Arc::make_mut(&mut Arc::make_mut(&mut self.state).viewports).remove(&id);
                 self.damage.layout = true;
@@ -96,6 +104,16 @@ impl Model {
             "win_viewport" => {
                 let id = grid_id(next(&mut a)?)?;
                 let window = window(next(&mut a)?)?;
+                let saved = self
+                    .reference
+                    .as_mut()
+                    .and_then(|reference| reference.take_viewport(id));
+                let margins = self
+                    .state
+                    .viewports
+                    .get(&id)
+                    .or_else(|| saved.as_ref().filter(|viewport| viewport.window == window))
+                    .map_or([0; 4], |viewport| viewport.margins);
                 let viewport = WindowViewport {
                     window,
                     topline: integer(next(&mut a)?)?,
@@ -104,7 +122,7 @@ impl Model {
                     curcol: integer(next(&mut a)?)?,
                     line_count: integer(next(&mut a)?)?,
                     scroll_delta: a.next().map(integer).transpose()?.unwrap_or(0),
-                    margins: self.state.viewports.get(&id).map_or([0; 4], |v| v.margins),
+                    margins,
                 };
                 bounded_insert(
                     Arc::make_mut(&mut Arc::make_mut(&mut self.state).viewports),
@@ -112,6 +130,17 @@ impl Model {
                     viewport,
                     limits,
                 )?;
+
+                // A viewport identifies the window, including when it is hidden.
+                // Recover the old placement only while it still matches this window.
+                if let Some(reference) = &mut self.reference
+                    && let Some(placement) = reference.take_placement(id)
+                    && placement_window(&placement) == Some(window)
+                    && !self.state.placements.contains_key(&id)
+                {
+                    self.restore_grid(id)?;
+                    self.set_placement(id, placement)?;
+                }
                 self.damage.layout = true;
             }
             "win_viewport_margins" => {
@@ -123,6 +152,9 @@ impl Model {
                     index(next(&mut a)?)?,
                     index(next(&mut a)?)?,
                 ];
+                if let Some(reference) = &mut self.reference {
+                    reference.take_viewport(id);
+                }
                 if !self.state.viewports.contains_key(&id) {
                     bounded_insert(
                         Arc::make_mut(&mut Arc::make_mut(&mut self.state).viewports),
@@ -157,13 +189,24 @@ impl Model {
     }
 
     fn placement(&mut self, id: GridId, kind: GridPlacementKind) -> Result<()> {
-        bounded_insert(
-            Arc::make_mut(&mut Arc::make_mut(&mut self.state).placements),
+        if let Some(reference) = &mut self.reference {
+            reference.take_placement(id);
+        }
+        self.restore_grid(id)?;
+        self.set_placement(
             id,
             GridPlacement {
                 kind,
                 hidden: false,
             },
+        )
+    }
+
+    fn set_placement(&mut self, id: GridId, placement: GridPlacement) -> Result<()> {
+        bounded_insert(
+            Arc::make_mut(&mut Arc::make_mut(&mut self.state).placements),
+            id,
+            placement,
             self.limits,
         )?;
         self.damage.layout = true;

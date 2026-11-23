@@ -4,6 +4,7 @@ use super::{Args, Model, Result};
 use crate::ProtocolError;
 use crate::model::*;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 impl Model {
@@ -16,29 +17,17 @@ impl Model {
                 let height = size(next(&mut a)?)?;
                 bounded_len(width, limits)?;
                 bounded_len(height, limits)?;
-                let count = width
-                    .checked_mul(height)
-                    .ok_or(ProtocolError::Limit("grid cells"))?;
-                let total = self
-                    .state
-                    .grids
-                    .iter()
-                    .filter(|(key, _)| **key != id)
-                    .try_fold(count, |n, (_, g)| {
-                        g.width
-                            .checked_mul(g.height)
-                            .and_then(|cells| n.checked_add(cells))
-                    })
-                    .ok_or(ProtocolError::Limit("grid cells"))?;
-                if total > limits.max_cells {
-                    return Err(ProtocolError::Limit("grid cells"));
-                }
-                if !self.state.grids.contains_key(&id) && self.state.grids.len() >= limits.max_grids
-                {
-                    return Err(ProtocolError::Limit("grids"));
+                self.check_grid_size(id, width, height)?;
+
+                let saved = self
+                    .reference
+                    .as_mut()
+                    .and_then(|reference| reference.take_grid(id));
+                if let Some(grid) = &saved {
+                    self.restore_grid_styles(grid)?;
                 }
                 let cell = Cell::default();
-                let old = self.state.grids.get(&id);
+                let old = self.state.grids.get(&id).or(saved.as_ref());
                 let mut rows = Vec::with_capacity(height);
                 for row in 0..height {
                     if let Some(src) = old
@@ -74,7 +63,10 @@ impl Model {
                 let cells = array(next(&mut a)?)?;
                 bounded_len(cells.len(), limits)?;
                 let wrap = boolean(next(&mut a)?)?;
-                let grid = grid_mut(&mut self.state, id)?;
+                self.restore_grid(id)?;
+                let state = Arc::make_mut(&mut self.state);
+                let grid = grid_mut(&mut state.grids, id)?;
+                let highlights = &mut state.highlights;
                 let cell_text = &mut self.cell_text;
                 if row >= grid.height || col > grid.width {
                     return invalid(name, "cell coordinates outside grid");
@@ -91,7 +83,12 @@ impl Model {
                     let mut cell = array(cell)?;
                     let text = cell_text.intern(string(next(&mut cell)?, limits)?);
                     if let Some(value) = cell.next() {
-                        highlight = Some(hl_id(value)?);
+                        let id = hl_id(value)?;
+                        if let Some(reference) = &self.reference {
+                            self.damage.full |=
+                                reference.restore_highlight(id, highlights, limits)?;
+                        }
+                        highlight = Some(id);
                     }
                     let highlight =
                         highlight.ok_or_else(|| bad(name, "first cell omits highlight"))?;
@@ -119,7 +116,8 @@ impl Model {
             }
             "grid_clear" => {
                 let id = grid_id(next(&mut a)?)?;
-                let grid = grid_mut(&mut self.state, id)?;
+                self.restore_grid(id)?;
+                let grid = grid_mut(&mut Arc::make_mut(&mut self.state).grids, id)?;
                 let (width, height) = (grid.width, grid.height);
                 let row = Arc::new(Row {
                     cells: vec![Cell::default(); width],
@@ -130,6 +128,12 @@ impl Model {
             }
             "grid_destroy" => {
                 let id = grid_id(next(&mut a)?)?;
+
+                if let Some(reference) = &mut self.reference {
+                    reference.take_grid(id);
+                    reference.take_placement(id);
+                    reference.take_viewport(id);
+                }
 
                 // A floating window can close before its grid's first resize.
                 Arc::make_mut(&mut Arc::make_mut(&mut self.state).grids).remove(&id);
@@ -147,6 +151,7 @@ impl Model {
                 let id = grid_id(next(&mut a)?)?;
                 let row = index(next(&mut a)?)?;
                 let col = index(next(&mut a)?)?;
+                self.restore_grid(id)?;
                 let grid = self
                     .state
                     .grids
@@ -166,7 +171,8 @@ impl Model {
                 let right = index(next(&mut a)?)?;
                 let rows = integer(next(&mut a)?)?;
                 let cols = integer(next(&mut a)?)?;
-                let grid = grid_mut(&mut self.state, id)?;
+                self.restore_grid(id)?;
+                let grid = grid_mut(&mut Arc::make_mut(&mut self.state).grids, id)?;
                 if top > bottom || bottom > grid.height || left > right || right > grid.width {
                     return invalid(name, "scroll region outside grid");
                 }
@@ -177,10 +183,66 @@ impl Model {
         }
         Ok(())
     }
+
+    fn check_grid_size(&self, id: GridId, width: usize, height: usize) -> Result<()> {
+        let count = width
+            .checked_mul(height)
+            .ok_or(ProtocolError::Limit("grid cells"))?;
+        let total = self
+            .state
+            .grids
+            .iter()
+            .filter(|(key, _)| **key != id)
+            .try_fold(count, |n, (_, g)| {
+                g.width
+                    .checked_mul(g.height)
+                    .and_then(|cells| n.checked_add(cells))
+            })
+            .ok_or(ProtocolError::Limit("grid cells"))?;
+        if total > self.limits.max_cells {
+            return Err(ProtocolError::Limit("grid cells"));
+        }
+        if !self.state.grids.contains_key(&id) && self.state.grids.len() >= self.limits.max_grids {
+            return Err(ProtocolError::Limit("grids"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_grid(&mut self, id: GridId) -> Result<()> {
+        let Some(reference) = &mut self.reference else {
+            return Ok(());
+        };
+        if self.state.grids.contains_key(&id) {
+            return Ok(());
+        }
+        let Some(grid) = reference.take_grid(id) else {
+            return Ok(());
+        };
+
+        self.check_grid_size(id, grid.width, grid.height)?;
+        self.restore_grid_styles(&grid)?;
+        self.dirty(id, 0, grid.height, 0, grid.width);
+        self.damage.layout = true;
+        Arc::make_mut(&mut Arc::make_mut(&mut self.state).grids).insert(id, grid);
+        Ok(())
+    }
+
+    fn restore_grid_styles(&mut self, grid: &Grid) -> Result<()> {
+        if let Some(reference) = &self.reference
+            && !reference.highlights.is_empty()
+        {
+            let highlights = &mut Arc::make_mut(&mut self.state).highlights;
+            for cell in grid.rows.iter().flat_map(|row| row.cells.iter()) {
+                self.damage.full |=
+                    reference.restore_highlight(cell.highlight, highlights, self.limits)?;
+            }
+        }
+        Ok(())
+    }
 }
 
-fn grid_mut(state: &mut Arc<State>, id: GridId) -> Result<&mut Grid> {
-    Arc::make_mut(&mut Arc::make_mut(state).grids)
+fn grid_mut(grids: &mut Arc<BTreeMap<GridId, Arc<Grid>>>, id: GridId) -> Result<&mut Grid> {
+    Arc::make_mut(grids)
         .get_mut(&id)
         .map(Arc::make_mut)
         .ok_or_else(|| bad("grid", "unknown grid"))

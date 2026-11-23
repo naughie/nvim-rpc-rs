@@ -6,13 +6,14 @@ mod frames;
 use frames::Sender;
 pub use frames::{Coalescing, Frames};
 
-use crate::{Checkpoint, CheckpointError, Limits, Model, RedrawError};
+use crate::{Checkpoint, CheckpointError, Grid, GridId, Limits, Model, RedrawError};
 
 use nvim_rpc_plugin::{Array, FromParams, Handler, Neovim};
 
 use tokio::io::AsyncWrite;
 
-use std::sync::{Mutex, MutexGuard};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Adds UI notification handling to an application's RPC handler.
 ///
@@ -48,6 +49,24 @@ impl<H> UiHandler<H> {
     ) -> Result<(Self, Frames), CheckpointError> {
         let model = Model::from_checkpoint(checkpoint, limits)?;
         Ok(Self::with_model(handler, model, limits))
+    }
+
+    /// Wraps a handler using [`Model::with_checkpoint_reference()`].
+    pub fn with_checkpoint_reference(
+        handler: H,
+        checkpoint: Checkpoint,
+        limits: Limits,
+    ) -> Result<(Self, Frames), CheckpointError> {
+        let model = Model::with_checkpoint_reference(checkpoint, limits)?;
+        Ok(Self::with_model(handler, model, limits))
+    }
+
+    /// Returns the model's current grids, including updates before a flush.
+    ///
+    /// Grids held only in a checkpoint reference join this map when the model
+    /// loads them in response to redraw events.
+    pub fn grids(&self) -> Arc<BTreeMap<GridId, Arc<Grid>>> {
+        Arc::clone(self.model().grids())
     }
 
     fn with_model(handler: H, model: Model, limits: Limits) -> (Self, Frames) {
@@ -93,8 +112,8 @@ where
         let args = params.with_borrowed_buffer();
         let result = self
             .model()
-            .apply_notification_with(method, args, |frame, flushed| {
-                self.frames.send(frame, flushed)
+            .apply_notification_with(method, args, |frame, checkpoint| {
+                self.frames.send(frame, checkpoint)
             });
         let error = match result {
             Ok(true) => return,

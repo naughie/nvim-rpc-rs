@@ -177,6 +177,20 @@ For an application-managed dispatcher, use [`Model::from_checkpoint()`] or
 Read the restored state to initialize the display. Ordered events in the saved
 session, such as bells and connection requests, are excluded.
 
+Use [`connect_with_checkpoint_reference()`] if a new stream should decide
+which grids and widgets are present. The model starts empty and uses the
+checkpoint as a reference for grid contents, placements, and highlights.
+A viewport for the same grid and window can recover the saved placement and
+hidden state. Fresh placement, visibility, and removal events take precedence.
+The new stream creates command lines and other external widgets.
+
+Use [`UiHandler::with_checkpoint_reference()`] for a plugin dispatcher and
+[`Model::with_checkpoint_reference()`] or [`Ui::with_checkpoint_reference()`]
+for an application-managed dispatcher. The first redraw flush requests a full
+repaint. Reference-mode checkpoints preserve unused grids and placements
+within the model's limits for later attachments. Read frames to present the
+objects observed on the new connection.
+
 ## Draw grids and widgets
 
 Attach with `UiOptions::ext_linegrid` enabled. Enable widget extensions such as
