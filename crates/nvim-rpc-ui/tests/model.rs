@@ -653,6 +653,74 @@ fn grid_destruction_clears_window_state_with_or_without_cells() {
 }
 
 #[test]
+fn shell_cursor_below_default_grid_preserves_redraw_progress() {
+    let mut model = Model::default();
+    replay(
+        &mut model,
+        (
+            ("grid_resize", (1, 80, 24)),
+            ("grid_cursor_goto", (1, 0, 0)),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+
+    let shell = replay(
+        &mut model,
+        (
+            ("grid_cursor_goto", (1, 24, 0)),
+            (
+                "msg_show",
+                ("shell_out", ((0, "ok"),), false, false, false, 1, ""),
+            ),
+            ("flush", ()),
+        ),
+    )
+    .unwrap();
+    let later = replay(
+        &mut model,
+        (("grid_cursor_goto", (1, 23, 7)), ("flush", ())),
+    )
+    .unwrap();
+
+    assert!(!model.is_failed());
+    let [shell] = shell.as_slice() else {
+        panic!("expected one shell output frame");
+    };
+    let [later] = later.as_slice() else {
+        panic!("expected one later frame");
+    };
+    assert_eq!((shell.sequence, later.sequence), (2, 3));
+    let message = &shell.state.messages.visible[0];
+    assert_eq!(&*message.content[0].text, "ok");
+    assert!(!shell.damage.cursor);
+    let cursor = shell.state.cursor.unwrap();
+    assert_eq!((cursor.grid, cursor.row, cursor.col), (GridId(1), 0, 0));
+    assert!(later.damage.cursor);
+    let cursor = later.state.cursor.unwrap();
+    assert_eq!((cursor.grid, cursor.row, cursor.col), (GridId(1), 23, 7));
+}
+
+#[test]
+fn rejects_other_out_of_bounds_grid_cursor_moves() {
+    for (id, row, col) in [(1, 25, 0), (1, 24, 1), (1, 23, 80), (2, 24, 0)] {
+        let mut model = Model::default();
+        let result = replay(
+            &mut model,
+            (
+                ("grid_resize", (id, 80, 24)),
+                ("grid_cursor_goto", (id, row, col)),
+            ),
+        );
+        assert!(
+            matches!(result, Err(ProtocolError::Invalid { event, reason: "cursor outside grid" }) if event == "grid_cursor_goto"),
+            "unexpected result for ({id}, {row}, {col})"
+        );
+        assert!(model.is_failed());
+    }
+}
+
+#[test]
 fn highlights_modes_tabline_options_and_global_events_are_typed() {
     use nvim_rpc::mp::encode::primitive::Map;
     let mut m = Model::default();
