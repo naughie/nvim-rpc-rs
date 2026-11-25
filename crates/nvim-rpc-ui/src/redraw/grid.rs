@@ -158,6 +158,11 @@ impl Model {
                     .get(&id)
                     .ok_or_else(|| bad(name, "unknown grid"))?;
                 if row >= grid.height || col >= grid.width {
+                    // With cmdheight=0, Neovim can move the cursor just below
+                    // the default grid before running :!.
+                    if id == GridId(1) && row == grid.height && col == 0 {
+                        return Ok(());
+                    }
                     return invalid(name, "cursor outside grid");
                 }
                 Arc::make_mut(&mut self.state).cursor = Some(Cursor { grid: id, row, col });
