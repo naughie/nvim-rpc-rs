@@ -753,7 +753,7 @@ version = "0.12.6-r2"
 
 [[package]]
 name = "nvim-rpc-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "nvim-rpc",
  "nvim-rpc-plugin",
